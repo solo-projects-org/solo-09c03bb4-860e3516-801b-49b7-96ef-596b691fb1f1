@@ -5,6 +5,7 @@
 
   const state = {
     catalog: null,        // { version, sha256, summary, created_at }
+    versions: [],         // 已发布版本列表
     selectedTable: null,
     selectedColumn: null,
     result: null,          // 最近一次分析结果
@@ -13,6 +14,15 @@
     collapsed: new Set(),
     filter: "",
     requestSeq: 0,
+    compare: {
+      oldVersion: null,
+      newVersion: null,
+      view: null,
+      sampleText: null,
+      sampleName: null,
+      result: null,        // 最近一次对照结果（固定对应所选两版）
+      seq: 0,
+    },
   };
 
   const $ = (id) => document.getElementById(id);
@@ -31,6 +41,19 @@
     analysisResult: $("analysis-result"),
     catalogOverview: $("catalog-overview"),
     footerVersion: $("footer-version"),
+    compareOld: $("compare-old"),
+    compareNew: $("compare-new"),
+    compareView: $("compare-view"),
+    compareSwap: $("compare-swap-btn"),
+    compareDropzone: $("compare-dropzone"),
+    compareFileInput: $("compare-file-input"),
+    compareFileTitle: $("compare-file-title"),
+    compareFileMeta: $("compare-file-meta"),
+    compareRunBtn: $("compare-run-btn"),
+    compareSampleBtn: $("compare-sample-btn"),
+    compareAlert: $("compare-alert"),
+    compareStatus: $("compare-status"),
+    compareResult: $("compare-result"),
   };
 
   async function api(path, options) {
@@ -120,11 +143,25 @@
       api("/api/versions"),
     ]);
     state.catalog = catalogRes.exists ? catalogRes : null;
+    state.versions = versionsRes.versions || [];
     renderActiveVersion(catalogRes);
-    renderVersions(versionsRes.versions || []);
+    renderVersions(state.versions);
     renderFieldPicker();
     renderCatalogOverview();
     renderAnalysis();
+    renderCompareForm();
+  }
+
+  /** 导入产生新版本后，补拉各版本摘要（视图名）并刷新对照表单。 */
+  async function refreshCatalogAndSummaries() {
+    await refreshCatalog();
+    try {
+      await ensureVersionSummaries();
+      renderCompareForm();
+    } catch (err) {
+      el.compareStatus.innerHTML =
+        `<p class="empty">版本摘要加载失败：${escapeHtml(err.message)}</p>`;
+    }
   }
 
   function renderActiveVersion(catalog) {
@@ -360,7 +397,7 @@
       el.dropzone.classList.remove("has-file");
       el.fileMeta.textContent = "base_tables + views（视图 SELECT 定义）";
       el.fileInput.value = "";
-      await refreshCatalog();
+      await refreshCatalogAndSummaries();
     } catch (err) {
       const errors =
         err.payload && err.payload.detail && Array.isArray(err.payload.detail.errors)
@@ -416,10 +453,14 @@
       if (previous === current) return;
       renderActiveVersion(catalog);
       const versionsRes = await api("/api/versions");
-      renderVersions(versionsRes.versions || []);
+      state.versions = versionsRes.versions || [];
+      renderVersions(state.versions);
       renderFieldPicker();
       renderCatalogOverview();
       renderAnalysis();
+      renderCompareForm();
+      // 对照结果固定对应所选两版；生效版本变化后重渲染以显示过期提示。
+      if (state.compare.result) renderCompareResult();
     } catch (_err) {
       /* 同步失败不影响已有结果展示 */
     }
@@ -539,16 +580,405 @@
     });
   }
 
+  /* ---------------- 跨版本结果对照 ---------------- */
+
+  /** 已发布版本（按版本号升序），用于两个版本下拉框。 */
+  function compareVersionOptions() {
+    return state.versions
+      .map((v) => v.version)
+      .sort((a, b) => a - b);
+  }
+
+  function renderCompareForm() {
+    const cmp = state.compare;
+    const versions = compareVersionOptions();
+
+    if (versions.length < 2) {
+      el.compareOld.innerHTML = "";
+      el.compareNew.innerHTML = "";
+      el.compareView.innerHTML = "";
+      el.compareRunBtn.disabled = true;
+      el.compareStatus.innerHTML = versions.length
+        ? '<p class="empty">至少需要两个已发布目录版本才能对照，可再导入一份目录。</p>'
+        : '<p class="empty">导入目录并产生至少两个版本后可用。</p>';
+      return;
+    }
+
+    // 保留此前选择；默认旧版选最早版本、新版选最新版本。
+    if (!versions.includes(cmp.oldVersion)) cmp.oldVersion = versions[0];
+    if (!versions.includes(cmp.newVersion)) cmp.newVersion = versions[versions.length - 1];
+    if (cmp.oldVersion === cmp.newVersion) {
+      cmp.newVersion = versions.find((v) => v !== cmp.oldVersion);
+    }
+
+    const versionOptions = (selected) =>
+      versions
+        .map((v) => {
+          const active = state.catalog && state.catalog.version === v ? "（生效中）" : "";
+          return `<option value="${v}"${v === selected ? " selected" : ""}>v${v}${active}</option>`;
+        })
+        .join("");
+    el.compareOld.innerHTML = versionOptions(cmp.oldVersion);
+    el.compareNew.innerHTML = versionOptions(cmp.newVersion);
+
+    renderCompareViewOptions();
+    updateCompareRunButton();
+    if (!cmp.result) el.compareStatus.innerHTML = "";
+  }
+
+  /** 目标视图下拉只列出两个版本同名（大小写不敏感）的共同视图。 */
+  function renderCompareViewOptions() {
+    const cmp = state.compare;
+    const common = commonViews(cmp.oldVersion, cmp.newVersion);
+    const previous = cmp.view;
+    el.compareView.innerHTML = common.length
+      ? common.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")
+      : "";
+    if (common.length) {
+      if (previous && common.some((name) => name.toLowerCase() === previous.toLowerCase())) {
+        const match = common.find((name) => name.toLowerCase() === previous.toLowerCase());
+        el.compareView.value = match;
+        cmp.view = match;
+      } else {
+        el.compareView.value = common[0];
+        cmp.view = common[0];
+      }
+    } else {
+      cmp.view = null;
+    }
+  }
+
+  function commonViews(oldVersion, newVersion) {
+    const oldSummary = summaryForVersion(oldVersion);
+    const newSummary = summaryForVersion(newVersion);
+    if (!oldSummary || !newSummary) return [];
+    const newNames = new Set((newSummary.views || []).map((v) => v.name.toLowerCase()));
+    const seen = new Set();
+    const result = [];
+    // 展示旧版中的原始名称；后端按大小写不敏感在两版目录中分别解析视图名。
+    (oldSummary.views || []).forEach((v) => {
+      const key = v.name.toLowerCase();
+      if (newNames.has(key) && !seen.has(key)) {
+        seen.add(key);
+        result.push(v.name);
+      }
+    });
+    return result;
+  }
+
+  function summaryForVersion(version) {
+    // /api/versions 只给视图数量；视图名需要逐版本摘要。结果缓存避免重复请求。
+    return state.versionSummaries && state.versionSummaries[version]
+      ? state.versionSummaries[version]
+      : null;
+  }
+
+  function updateCompareRunButton() {
+    const cmp = state.compare;
+    el.compareRunBtn.disabled =
+      !cmp.oldVersion ||
+      !cmp.newVersion ||
+      cmp.oldVersion === cmp.newVersion ||
+      !cmp.view ||
+      !cmp.sampleText;
+  }
+
+  function showCompareAlert(kind, title, lines) {
+    el.compareAlert.hidden = false;
+    el.compareAlert.className = `alert ${kind}`;
+    const list = lines && lines.length
+      ? `<ul>${lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>`
+      : "";
+    el.compareAlert.innerHTML = `<div class="alert-title">${escapeHtml(title)}</div>${list}`;
+  }
+
+  async function readCompareFile(file) {
+    if (!file) return;
+    if (!/\.json$/i.test(file.name) && file.type !== "application/json") {
+      showCompareAlert("error", "请选择 .json 文件", []);
+      return;
+    }
+    const text = await file.text();
+    state.compare.sampleText = text;
+    state.compare.sampleName = file.name;
+    el.compareDropzone.classList.add("has-file");
+    el.compareFileTitle.textContent = file.name;
+    el.compareFileMeta.textContent = "样本已载入，提交时再次校验格式与 500 行上限";
+    el.compareAlert.hidden = true;
+    updateCompareRunButton();
+  }
+
+  el.compareFileInput.addEventListener("change", (event) =>
+    readCompareFile(event.target.files[0]),
+  );
+  ["dragenter", "dragover"].forEach((type) => {
+    el.compareDropzone.addEventListener(type, (event) => {
+      event.preventDefault();
+      el.compareDropzone.classList.add("dragover");
+    });
+  });
+  ["dragleave", "drop"].forEach((type) => {
+    el.compareDropzone.addEventListener(type, (event) => {
+      event.preventDefault();
+      el.compareDropzone.classList.remove("dragover");
+    });
+  });
+  el.compareDropzone.addEventListener("drop", (event) => {
+    const file = event.dataTransfer.files && event.dataTransfer.files[0];
+    readCompareFile(file);
+  });
+
+  el.compareSwap.addEventListener("click", () => {
+    const cmp = state.compare;
+    const tmp = cmp.oldVersion;
+    cmp.oldVersion = cmp.newVersion;
+    cmp.newVersion = tmp;
+    renderCompareForm();
+  });
+
+  el.compareOld.addEventListener("change", () => {
+    state.compare.oldVersion = Number(el.compareOld.value);
+    if (state.compare.oldVersion === state.compare.newVersion) {
+      state.compare.newVersion = Number(
+        compareVersionOptions().find((v) => v !== state.compare.oldVersion),
+      );
+    }
+    renderCompareForm();
+  });
+  el.compareNew.addEventListener("change", () => {
+    state.compare.newVersion = Number(el.compareNew.value);
+    if (state.compare.oldVersion === state.compare.newVersion) {
+      state.compare.oldVersion = Number(
+        compareVersionOptions().find((v) => v !== state.compare.newVersion),
+      );
+    }
+    renderCompareForm();
+  });
+  el.compareView.addEventListener("change", () => {
+    state.compare.view = el.compareView.value;
+    updateCompareRunButton();
+  });
+
+  el.compareSampleBtn.addEventListener("click", async () => {
+    try {
+      const sample = await api("/api/compare/sample");
+      state.compare.sampleText = JSON.stringify(sample.samples, null, 2);
+      state.compare.sampleName = "compare_sample.json（示例）";
+      el.compareDropzone.classList.add("has-file");
+      el.compareFileTitle.textContent = "compare_sample.json（示例样本）";
+      el.compareFileMeta.textContent =
+        `目标视图示例：${sample.view}；样本已载入，可直接运行对照`;
+      el.compareAlert.hidden = true;
+      if (!state.compare.view && sample.view) state.compare.view = sample.view;
+      updateCompareRunButton();
+    } catch (err) {
+      showCompareAlert("error", err.message, []);
+    }
+  });
+
+  el.compareRunBtn.addEventListener("click", async () => {
+    const cmp = state.compare;
+    if (!cmp.sampleText || !cmp.view) return;
+    let samples;
+    try {
+      samples = JSON.parse(cmp.sampleText);
+    } catch (_err) {
+      showCompareAlert("error", "样本 JSON 解析失败，请检查文件内容", []);
+      return;
+    }
+    el.compareRunBtn.disabled = true;
+    const originalLabel = el.compareRunBtn.textContent;
+    el.compareRunBtn.innerHTML = '<span class="spinner"></span>运行中…';
+    const seq = ++cmp.seq;
+    el.compareStatus.innerHTML = '<p class="empty">正在两个版本上重建视图链并执行…</p>';
+    el.compareResult.innerHTML = "";
+    try {
+      const result = await api("/api/compare", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          old_version: cmp.oldVersion,
+          new_version: cmp.newVersion,
+          view: cmp.view,
+          samples,
+        }),
+      });
+      if (seq !== cmp.seq) return;
+      cmp.result = result;
+      renderCompareResult();
+    } catch (err) {
+      if (seq !== cmp.seq) return;
+      cmp.result = null;
+      el.compareResult.innerHTML = "";
+      el.compareStatus.innerHTML = "";
+      showCompareAlert("error", err.message, []);
+    } finally {
+      el.compareRunBtn.textContent = originalLabel;
+      updateCompareRunButton();
+    }
+  });
+
+  function renderCompareResult() {
+    const result = state.compare.result;
+    el.compareAlert.hidden = true;
+    if (!result) {
+      el.compareStatus.innerHTML = "";
+      el.compareResult.innerHTML = "";
+      return;
+    }
+    const { old: oldMeta, new: newMeta } = result.versions;
+    const active = state.catalog ? state.catalog.version : null;
+    const staleNote =
+      active !== null && active !== oldMeta.version && active !== newMeta.version
+        ? `<span class="stale">当前生效目录为 v${active}，本结果仍只对应 v${oldMeta.version} 与 v${newMeta.version}</span>`
+        : "";
+    el.compareStatus.innerHTML = `
+      <div class="compare-pin">
+        对照视图 <b>${escapeHtml(result.view)}</b> ·
+        旧版 <span class="pin">v${oldMeta.version}</span>
+        vs 新版 <span class="pin">v${newMeta.version}</span>
+        ${staleNote}
+      </div>`;
+
+    if (result.status === "error") {
+      const items = result.errors
+        .map(
+          (e) =>
+            `<li>v${e.version}：${escapeHtml(e.reason)}${
+              e.elapsed_ms !== undefined ? `（${e.elapsed_ms} ms）` : ""
+            }</li>`,
+        )
+        .join("");
+      el.compareResult.innerHTML = `
+        <div class="compare-error-box">
+          <div class="alert-title">对照未完成，不展示部分差异</div>
+          <ul>${items}</ul>
+        </div>`;
+      return;
+    }
+
+    if (result.status === "structure_mismatch") {
+      el.compareResult.innerHTML = `
+        <div class="compare-block">
+          <div class="compare-banner structure">两版输出列名不同，存在结构差异（不再比较数据行）</div>
+          <div class="structure-grid">
+            <div>
+              <div class="section-title">旧版 v${oldMeta.version} 输出列（${result.old_columns.length}）</div>
+              ${result.old_columns.map((c) => `<span class="pill">${escapeHtml(c)}</span>`).join("")}
+            </div>
+            <div>
+              <div class="section-title">新版 v${newMeta.version} 输出列（${result.new_columns.length}）</div>
+              ${result.new_columns.map((c) => `<span class="pill">${escapeHtml(c)}</span>`).join("")}
+            </div>
+          </div>
+          <table class="diff-table">
+            <thead><tr><th>仅旧版有的列</th><th>仅新版有的列</th></tr></thead>
+            <tbody><tr>
+              <td>${result.removed_columns.map(escapeHtml).join("、") || "—"}</td>
+              <td>${result.added_columns.map(escapeHtml).join("、") || "—"}</td>
+            </tr></tbody>
+          </table>
+          ${result.order_changed ? '<p class="empty">列名集合相同但顺序不同。</p>' : ""}
+          ${renderCompareMeta(result)}
+        </div>`;
+      return;
+    }
+
+    const identical = result.status === "identical";
+    const banner = identical
+      ? '<div class="compare-banner ok">两版输出完全一致（多重集相同，行顺序差异已忽略）</div>'
+      : '<div class="compare-banner different">两版输出存在数据行差异（按完整行的多重集对照，行顺序不计）</div>';
+    el.compareResult.innerHTML = `
+      <div class="compare-block">
+        ${banner}
+        <div class="stat-row">
+          <div class="stat"><div class="n">${result.row_counts.old}</div><div class="l">旧版输出行数</div></div>
+          <div class="stat"><div class="n">${result.row_counts.new}</div><div class="l">新版输出行数</div></div>
+          <div class="stat warn"><div class="n">${result.old_only_total}</div><div class="l">旧版独有行（合计次数）</div></div>
+          <div class="stat danger"><div class="n">${result.new_only_total}</div><div class="l">新版独有行（合计次数）</div></div>
+        </div>
+        ${identical ? "" : renderDiffTables(result)}
+        ${renderCompareMeta(result)}
+      </div>`;
+  }
+
+  function renderCompareMeta(result) {
+    if (!result.timing_ms) return "";
+    return `<p class="empty compare-meta">执行耗时：旧版 ${result.timing_ms.old} ms · 新版 ${result.timing_ms.new} ms（上限 3000 ms，每版输出上限 2000 行）</p>`;
+  }
+
+  function renderDiffTables(result) {
+    const columns = result.columns || [];
+    const head = columns.map((c) => `<th>${escapeHtml(c)}</th>`).join("");
+    const rowsOf = (entries) =>
+      entries.length
+        ? entries
+            .map(
+              (entry) =>
+                `<tr><td class="diff-count">×${entry.count}</td>${entry.row
+                  .map((v) => `<td>${formatCell(v)}</td>`)
+                  .join("")}</tr>`,
+            )
+            .join("")
+        : '<tr><td class="empty" colspan="' + (columns.length + 1) + '">无</td></tr>';
+    return `
+      <div class="diff-grid">
+        <div>
+          <div class="section-title">仅旧版 v${result.versions.old.version} 独有（${result.old_only.length} 种行 / ${result.old_only_total} 次）</div>
+          <div class="diff-table-wrap">
+            <table class="diff-table">
+              <thead><tr><th>次数</th>${head}</tr></thead>
+              <tbody>${rowsOf(result.old_only)}</tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <div class="section-title">仅新版 v${result.versions.new.version} 独有（${result.new_only.length} 种行 / ${result.new_only_total} 次）</div>
+          <div class="diff-table-wrap">
+            <table class="diff-table">
+              <thead><tr><th>次数</th>${head}</tr></thead>
+              <tbody>${rowsOf(result.new_only)}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function formatCell(value) {
+    if (value === null) return '<span class="null-cell">NULL</span>';
+    if (typeof value === "boolean") return value ? "true" : "false";
+    return escapeHtml(String(value));
+  }
+
+  /** 加载两个所选版本的摘要（视图名），供共同视图下拉使用。 */
+  async function ensureVersionSummaries() {
+    const versions = compareVersionOptions();
+    state.versionSummaries = state.versionSummaries || {};
+    await Promise.all(
+      versions.map(async (v) => {
+        if (state.versionSummaries[v]) return;
+        const detail = await api(`/api/versions/${v}`);
+        state.versionSummaries[v] = detail.summary;
+      }),
+    );
+  }
+
   /* ---------------- 启动 ---------------- */
-  refreshCatalog().catch((err) => {
+  async function bootstrap() {
+    await refreshCatalogAndSummaries();
+  }
+
+  bootstrap().catch((err) => {
     el.catalogOverview.innerHTML = `<p class="empty">加载失败：${escapeHtml(err.message)}</p>`;
   });
 
-  // 页面重新获得焦点时轻量核对生效版本，及时标记过期结果。
+  // 页面重新获得焦点时轻量核对生效版本，及时标记过期结果（影响分析或对照）。
   window.addEventListener("focus", () => {
-    if (state.result) syncActiveVersion();
+    if (state.result || state.compare.result) syncActiveVersion();
   });
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && state.result) syncActiveVersion();
+    if (!document.hidden && (state.result || state.compare.result)) {
+      syncActiveVersion();
+    }
   });
 })();

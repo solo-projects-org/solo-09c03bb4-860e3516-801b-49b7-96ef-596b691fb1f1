@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .catalog import CatalogError
+from .compare import CompareRequestError, compare_versions
 from .impact import analyze_impact
 from .storage import CatalogStore
 
@@ -135,6 +136,44 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "is_active": bool(row.get("is_active")),
         }
         return result
+
+    @app.get("/api/compare/sample")
+    def compare_sample() -> dict[str, Any]:
+        sample_path = BASE_DIR / "samples" / "compare_sample.json"
+        if not sample_path.is_file():
+            raise HTTPException(status_code=404, detail="对照样本不存在")
+        return json.loads(sample_path.read_text(encoding="utf-8"))
+
+    @app.post("/api/compare")
+    def run_compare(payload: dict[str, Any]) -> dict[str, Any]:
+        """跨版本对照：用样本在两个不可变版本快照上分别运行完整视图链。"""
+        old_version = payload.get("old_version")
+        new_version = payload.get("new_version")
+        view_name = payload.get("view")
+        samples = payload.get("samples")
+
+        if isinstance(old_version, bool) or not isinstance(old_version, int):
+            raise HTTPException(status_code=422, detail="old_version 必须是整数")
+        if isinstance(new_version, bool) or not isinstance(new_version, int):
+            raise HTTPException(status_code=422, detail="new_version 必须是整数")
+        if old_version == new_version:
+            raise HTTPException(status_code=422, detail="必须选择两个不同的目录版本")
+        if not isinstance(view_name, str) or not view_name.strip():
+            raise HTTPException(status_code=422, detail="view 必须是非空字符串")
+
+        old_loaded = store.load_catalog(old_version)
+        if old_loaded is None:
+            raise HTTPException(status_code=404, detail=f"版本 {old_version} 不存在")
+        new_loaded = store.load_catalog(new_version)
+        if new_loaded is None:
+            raise HTTPException(status_code=404, detail=f"版本 {new_version} 不存在")
+
+        try:
+            return compare_versions(
+                old_loaded, new_loaded, view_name.strip(), samples
+            )
+        except CompareRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

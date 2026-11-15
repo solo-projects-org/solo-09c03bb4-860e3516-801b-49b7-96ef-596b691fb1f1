@@ -74,6 +74,49 @@
     </div>
   </section>
 
+  <section class="compare-section">
+    <div class="panel compare-panel">
+      <div class="panel-head">
+        <h2>3 · 跨版本结果对照</h2>
+        <span class="hint">选择两个已发布版本与共同视图，用同一份基础表样本分别运行完整上游视图链；对照结果固定对应所选版本，期间导入新目录不影响本次结果</span>
+      </div>
+
+      <div class="compare-form">
+        <div class="compare-field">
+          <label for="compare-old">旧版本（基线）</label>
+          <select id="compare-old"></select>
+        </div>
+        <div class="compare-swap" title="交换两个版本">
+          <button type="button" class="btn ghost small" id="compare-swap-btn">⇄ 交换</button>
+        </div>
+        <div class="compare-field">
+          <label for="compare-new">新版本（待核对）</label>
+          <select id="compare-new"></select>
+        </div>
+        <div class="compare-field">
+          <label for="compare-view">共同目标视图</label>
+          <select id="compare-view"></select>
+        </div>
+      </div>
+
+      <label class="dropzone compare-dropzone" id="compare-dropzone" for="compare-file-input">
+        <input type="file" id="compare-file-input" accept=".json,application/json" hidden />
+        <span class="drop-icon" aria-hidden="true">⇪</span>
+        <span class="drop-title" id="compare-file-title">选择或拖入样本 JSON（按基础表名提供 columns 和 rows）</span>
+        <span class="drop-meta" id="compare-file-meta">样本总计最多 500 行；须覆盖两版视图链所需字段</span>
+      </label>
+
+      <div class="import-actions">
+        <button class="btn primary" id="compare-run-btn" disabled>运行跨版本对照</button>
+        <button class="btn ghost" id="compare-sample-btn" type="button">载入对照样本</button>
+      </div>
+
+      <div class="alert" id="compare-alert" hidden></div>
+      <div class="compare-status" id="compare-status"></div>
+      <div id="compare-result"></div>
+    </div>
+  </section>
+
   <footer class="footer">
     <span>FastAPI · SQLite · sqlglot</span>
     <span id="footer-version"></span>

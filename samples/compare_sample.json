@@ -1,0 +1,38 @@
+{
+  "view": "vw_settlement",
+  "samples": {
+    "orders": {
+      "columns": [
+        "order_id",
+        "customer_id",
+        "currency",
+        "status",
+        "amount",
+        "discount_amount",
+        "created_at",
+        "region_code"
+      ],
+      "rows": [
+        [1001, 7, "CNY", "paid", 1000.0, 50.0, "2026-10-01 10:00:00", "CN-EAST"],
+        [1002, 7, "CNY", "paid", 800.0, 0.0, "2026-10-02 11:30:00", "CN-EAST"],
+        [1003, 9, "USD", "open", 420.0, 20.0, "2026-10-03 09:15:00", "CN-NORTH"],
+        [1004, 9, "USD", "paid", 420.0, 20.0, "2026-10-04 16:45:00", "CN-NORTH"]
+      ]
+    },
+    "payments": {
+      "columns": [
+        "payment_id",
+        "order_id",
+        "paid_amount",
+        "paid_at",
+        "channel",
+        "refund_amount"
+      ],
+      "rows": [
+        [5001, 1001, 900.0, "2026-10-01 12:00:00", "card", 0.0],
+        [5002, 1002, 800.0, "2026-10-02 13:00:00", "wallet", 1200.0],
+        [5003, 1004, 300.0, "2026-10-05 10:00:00", "card", 0.0]
+      ]
+    }
+  }
+}
